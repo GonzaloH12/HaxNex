@@ -70,6 +70,6 @@ jobs:
         with:
           tag_name: v${{ inputs.version }}
           files: |
-            dist-release/HaxBall-Setup-*.exe
-            dist-release/HaxBall-*-win64.zip
+            dist-release/HaxNex-Setup-*.exe
+            dist-release/HaxNex-*-win64.zip
             dist-release/manifest.json
