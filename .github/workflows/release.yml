@@ -1,75 +1,235 @@
 name: release
 
 # Builds a release of the (private) app code and publishes it here, where the
-# app looks for updates. Run it from the Actions tab with the version number
-# (it must match native/player/Cargo.toml in the code repo, tag v<version>).
-# Public repos get free Actions minutes; the code repo stays private.
+# app looks for updates. Run it from the Actions tab on the default branch with
+# the exact semantic version number (MAJOR.MINOR.PATCH, matching
+# native/player/Cargo.toml and tag v<version> in GonzaloH12/HaxballAPP).
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, like 0.1.0 (tag v0.1.0 in GonzaloH12/HaxballAPP)"
+        description: "Exact semantic version to release, e.g. 0.1.0 (tag v0.1.0 in GonzaloH12/HaxballAPP)"
         required: true
+        type: string
 
-permissions:
-  contents: write
+# Default to zero permissions; only the isolated signing/publishing job gets contents: write.
+permissions: {}
 
 jobs:
-  windows:
+  build:
+    name: Build and verify unsigned artifacts
     runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions: {}
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      source_commit: ${{ steps.verify_source.outputs.source_commit }}
+      zip_sha256: ${{ steps.verify_artifacts.outputs.zip_sha256 }}
+      installer_sha256: ${{ steps.verify_artifacts.outputs.installer_sha256 }}
     steps:
-      - name: Code
-        uses: actions/checkout@v4
+      - name: Validate version input
+        id: validate
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${INPUT_VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid version format. Expected strict MAJOR.MINOR.PATCH without 'v' prefix or extra characters."
+            exit 1
+          fi
+          echo "version=${INPUT_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private source repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: GonzaloH12/HaxballAPP
-          ref: v${{ inputs.version }}
+          ref: refs/tags/v${{ steps.validate.outputs.version }}
           token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+          clean: true
 
-      - name: Version
+      - name: Verify source version and credential hygiene
+        id: verify_source
         shell: bash
+        env:
+          EXPECTED_VERSION: ${{ steps.validate.outputs.version }}
         run: |
+          set -euo pipefail
+          if git config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
+            echo "::error::Git credentials must not persist in .git/config after checkout."
+            exit 1
+          fi
           ver=$(grep -m1 '^version' native/player/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          if [ "${ver}" != "${{ inputs.version }}" ]; then
-            echo "Cargo.toml says ${ver}, not ${{ inputs.version }}"; exit 1
+          if [[ "${ver}" != "${EXPECTED_VERSION}" ]]; then
+            echo "::error::native/player/Cargo.toml version (${ver}) does not match requested version (${EXPECTED_VERSION})."
+            exit 1
+          fi
+          commit_sha=$(git rev-parse --verify HEAD)
+          echo "source_commit=${commit_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # v1 (master)
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo registry and build directory
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            native/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/Cargo.lock') }}
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Install Campus dependencies and run Campus test suite
+        shell: bash
+        working-directory: campus
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+
+      - name: Run Rust workspace tests and build release executable
+        shell: bash
+        working-directory: native
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=."
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace
+          cargo build --locked --release -p haxball-player
+
+      - name: Lay out install tree
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          python native/tools/package.py "${RELEASE_VERSION}" dist-release --no-zip
+
+      # Code signing goes here once there is a Windows Authenticode certificate:
+      # sign dist-release/app/haxball-player.exe BEFORE zipping and building the installer.
+
+      - name: Build update ZIP and unsigned manifest
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          python native/tools/package.py "${RELEASE_VERSION}" dist-release --zip-only
+
+      - name: Build Windows installer with Inno Setup
+        shell: cmd
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          WORKSPACE_DIR: ${{ github.workspace }}
+        run: |
+          iscc "/DAppVersion=%RELEASE_VERSION%" "/DSourceDir=%WORKSPACE_DIR%\dist-release\app" "/DOutDir=%WORKSPACE_DIR%\dist-release" "native\installer\haxball.iss"
+
+      - name: Verify release artifacts and record hashes
+        id: verify_artifacts
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dist-release/app
+          python native/tools/package.py "${RELEASE_VERSION}" dist-release --verify-release
+          zip_sha=$(python -c "import json; m=json.load(open('dist-release/build-manifest.json')); print(m['artifacts']['zip']['sha256'])")
+          inst_sha=$(python -c "import json; m=json.load(open('dist-release/build-manifest.json')); print(m['artifacts']['installer']['sha256'])")
+          echo "zip_sha256=${zip_sha}" >> "${GITHUB_OUTPUT}"
+          echo "installer_sha256=${inst_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload verified unsigned release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v4.4.0
+        with:
+          name: unsigned-release-${{ steps.validate.outputs.version }}
+          if-no-files-found: error
+          retention-days: 5
+          path: |
+            dist-release/HaxNex-${{ steps.validate.outputs.version }}-win64.zip
+            dist-release/HaxNex-Setup-${{ steps.validate.outputs.version }}.exe
+            dist-release/manifest.json
+            dist-release/build-manifest.json
+            native/tools/package.py
+            native/tools/sign.mjs
+
+  sign_and_publish:
+    name: Sign manifest and publish GitHub Release
+    needs: build
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - name: Setup Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Download unsigned release bundle
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v4.1.8
+        with:
+          name: unsigned-release-${{ needs.build.outputs.version }}
+          path: staged
+
+      - name: Verify downloaded artifact hashes before signing
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          EXPECTED_ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
+          EXPECTED_INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
+        run: |
+          set -euo pipefail
+          python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release
+          actual_zip_sha=$(python -c "import json; m=json.load(open('staged/dist-release/build-manifest.json')); print(m['artifacts']['zip']['sha256'])")
+          actual_inst_sha=$(python -c "import json; m=json.load(open('staged/dist-release/build-manifest.json')); print(m['artifacts']['installer']['sha256'])")
+          if [[ "${actual_zip_sha}" != "${EXPECTED_ZIP_SHA256}" || "${actual_inst_sha}" != "${EXPECTED_INSTALLER_SHA256}" ]]; then
+            echo "::error::Artifact SHA-256 mismatch between build job and signing job."
+            exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Campus dependencies
-        run: npm ci
-        working-directory: campus
-
-      - name: Build
-        run: cargo build --release -p haxball-player
-        working-directory: native
-
-      - name: Lay out the install tree
-        run: python native/tools/package.py ${{ inputs.version }} dist-release --no-zip
-
-      # Code signing goes here once there is a certificate: sign
-      # dist-release/app/haxball-player.exe.
-
-      - name: Zip and manifest
-        run: python native/tools/package.py ${{ inputs.version }} dist-release --zip-only
-
-      - name: Sign the manifest
+      - name: Sign and verify update manifest
+        shell: bash
         env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-        run: node native/tools/sign.mjs sign dist-release/manifest.json
+        run: |
+          set -euo pipefail
+          node staged/native/tools/sign.mjs sign staged/dist-release/manifest.json
+          node staged/native/tools/sign.mjs verify staged/dist-release/manifest.json
+          python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release --require-signature
 
-      - name: Installer
-        run: iscc /DAppVersion=${{ inputs.version }} /DSourceDir=${{ github.workspace }}\dist-release\app /DOutDir=${{ github.workspace }}\dist-release native\installer\haxball.iss
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ inputs.version }}
-          files: |
-            dist-release/HaxNex-Setup-*.exe
-            dist-release/HaxNex-*-win64.zip
-            dist-release/manifest.json
+      - name: Publish deterministic release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip_file="staged/dist-release/HaxNex-${RELEASE_VERSION}-win64.zip"
+          exe_file="staged/dist-release/HaxNex-Setup-${RELEASE_VERSION}.exe"
+          manifest_file="staged/dist-release/manifest.json"
+          build_manifest_file="staged/dist-release/build-manifest.json"
+          for f in "${zip_file}" "${exe_file}" "${manifest_file}" "${build_manifest_file}"; do
+            if [[ ! -s "${f}" ]]; then
+              echo "::error::Missing or empty required release file: ${f}"
+              exit 1
+            fi
+          done
+          gh release create "v${RELEASE_VERSION}" \
+            "${exe_file}" \
+            "${zip_file}" \
+            "${manifest_file}" \
+            "${build_manifest_file}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "HaxNex v${RELEASE_VERSION}" \
+            --notes-file - <<< "Release v${RELEASE_VERSION} (source commit \`${{ needs.build.outputs.source_commit }}\`)."
