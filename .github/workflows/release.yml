@@ -8,19 +8,24 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Exact semantic version to release, e.g. 0.1.0 (tag v0.1.0 in GonzaloH12/HaxballAPP)"
+        description: "Exact semantic version to release, e.g. 0.1.2 (tag v0.1.2 in GonzaloH12/HaxballAPP)"
         required: true
         type: string
 
-# Default to zero permissions; only the isolated signing/publishing job gets contents: write.
-permissions: {}
+# Default to minimal read-only permissions; only the isolated signing/publishing job gets contents: write.
+permissions:
+  contents: read
+
+env:
+  ESBUILD_VERSION: "0.25.0"
 
 jobs:
   build:
     name: Build and verify unsigned artifacts
     runs-on: windows-latest
     if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    permissions: {}
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.validate.outputs.version }}
       source_commit: ${{ steps.verify_source.outputs.source_commit }}
@@ -88,12 +93,14 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install Campus dependencies and run Campus test suite
+      - name: Install Campus production dependencies and pinned esbuild tool
         shell: bash
         working-directory: campus
         run: |
           set -euo pipefail
-          npm ci
+          npm ci --omit=dev --ignore-scripts
+          npm install --prefix "${RUNNER_TEMP}/esbuild-tool" --no-save --ignore-scripts "esbuild@${ESBUILD_VERSION}"
+          echo "${RUNNER_TEMP}/esbuild-tool/node_modules/.bin" >> "${GITHUB_PATH}"
           npm test
 
       - name: Run Rust workspace tests and build release executable
@@ -106,13 +113,18 @@ jobs:
           cargo test --locked --workspace
           cargo build --locked --release -p haxball-player
 
-      - name: Lay out install tree
+      - name: Lay out install tree and bundle Campus into dist/sala/
         shell: bash
         env:
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.verify_source.outputs.source_commit }}
         run: |
           set -euo pipefail
           python native/tools/package.py "${RELEASE_VERSION}" dist-release --no-zip
+          if [[ -e "dist-release/app/campus/src" ]]; then
+            echo "::error::Private Campus source folder dist-release/app/campus/src must never be present in release tree."
+            exit 1
+          fi
 
       # Code signing goes here once there is a Windows Authenticode certificate:
       # sign dist-release/app/haxball-player.exe BEFORE zipping and building the installer.
@@ -121,6 +133,7 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.verify_source.outputs.source_commit }}
         run: |
           set -euo pipefail
           python native/tools/package.py "${RELEASE_VERSION}" dist-release --zip-only
@@ -138,6 +151,7 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          EXPECTED_SOURCE_COMMIT: ${{ steps.verify_source.outputs.source_commit }}
         run: |
           set -euo pipefail
           rm -rf dist-release/app
@@ -158,6 +172,7 @@ jobs:
             dist-release/HaxNex-Setup-${{ steps.validate.outputs.version }}.exe
             dist-release/manifest.json
             dist-release/build-manifest.json
+            native/tools/bundle_campus.py
             native/tools/package.py
             native/tools/sign.mjs
 
@@ -185,6 +200,7 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
           EXPECTED_ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
           EXPECTED_INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
         run: |
@@ -197,24 +213,37 @@ jobs:
             exit 1
           fi
 
-      - name: Sign and verify update manifest
+      - name: Sign and verify update manifest and release provenance statement
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           node staged/native/tools/sign.mjs sign staged/dist-release/manifest.json
           node staged/native/tools/sign.mjs verify staged/dist-release/manifest.json
+          python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release
+          node staged/native/tools/sign.mjs sign-provenance staged/dist-release/build-manifest.json
+          node staged/native/tools/sign.mjs verify-provenance staged/dist-release/build-manifest.json
           python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release --require-signature
 
-      - name: Publish deterministic release assets
+      - name: Enforce release immutability and publish deterministic release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
         run: |
           set -euo pipefail
+          if gh release view "v${RELEASE_VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::Release v${RELEASE_VERSION} already exists. Immutable release policy forbids overwriting published releases; increment PATCH version for hotfixes."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/v${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${RELEASE_VERSION} already exists in ${GITHUB_REPOSITORY}. Refusing to mutate an existing release tag."
+            exit 1
+          fi
           zip_file="staged/dist-release/HaxNex-${RELEASE_VERSION}-win64.zip"
           exe_file="staged/dist-release/HaxNex-Setup-${RELEASE_VERSION}.exe"
           manifest_file="staged/dist-release/manifest.json"
@@ -232,4 +261,4 @@ jobs:
             "${build_manifest_file}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "HaxNex v${RELEASE_VERSION}" \
-            --notes-file - <<< "Release v${RELEASE_VERSION} (source commit \`${{ needs.build.outputs.source_commit }}\`)."
+            --notes-file - <<< "Release v${RELEASE_VERSION} (source commit \`${SOURCE_COMMIT}\`)."
