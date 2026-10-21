@@ -101,6 +101,7 @@ jobs:
           npm ci --omit=dev --ignore-scripts
           npm rebuild node-datachannel --foreground-scripts
           npm install --prefix "${RUNNER_TEMP}/esbuild-tool" --no-save --ignore-scripts "esbuild@${ESBUILD_VERSION}"
+          export ESBUILD_BIN="${RUNNER_TEMP}/esbuild-tool/node_modules/.bin/esbuild.cmd"
           echo "${RUNNER_TEMP}/esbuild-tool/node_modules/.bin" >> "${GITHUB_PATH}"
           npm test
 
