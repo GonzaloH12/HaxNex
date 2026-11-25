@@ -171,13 +171,8 @@ jobs:
           name: unsigned-release-${{ steps.validate.outputs.version }}
           if-no-files-found: error
           retention-days: 5
-          # The whole folder: after --verify-release it holds only the zips, the
-          # installer and the manifests (app/ and training/ were removed above).
-          path: |
-            dist-release/
-            native/tools/bundle_campus.py
-            native/tools/package.py
-            native/tools/sign.mjs
+          # Only public release artifacts (zips, installer, manifests); never upload private build scripts.
+          path: dist-release/
 
   sign_and_publish:
     name: Sign manifest and publish GitHub Release
@@ -188,6 +183,33 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout private build tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: GonzaloH12/HaxballAPP
+          ref: refs/tags/v${{ needs.build.outputs.version }}
+          token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: native/tools
+          path: tools-repo
+          clean: true
+
+      - name: Verify private tools checkout and credential hygiene
+        shell: bash
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if git -C tools-repo config --local --get-all http.https://github.com/.extraheader >/dev/null 2>&1; then
+            echo "::error::Git credentials must not persist in tools-repo/.git/config after checkout."
+            exit 1
+          fi
+          actual_commit=$(git -C tools-repo rev-parse --verify HEAD)
+          if [[ "${actual_commit}" != "${EXPECTED_SOURCE_COMMIT}" ]]; then
+            echo "::error::tools-repo commit (${actual_commit}) does not match build source commit (${EXPECTED_SOURCE_COMMIT})."
+            exit 1
+          fi
+
       - name: Setup Node.js 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -197,7 +219,7 @@ jobs:
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v4.1.8
         with:
           name: unsigned-release-${{ needs.build.outputs.version }}
-          path: staged
+          path: staged/dist-release
 
       - name: Verify downloaded artifact hashes before signing
         shell: bash
@@ -208,7 +230,7 @@ jobs:
           EXPECTED_INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
         run: |
           set -euo pipefail
-          python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release
+          python tools-repo/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release
           actual_zip_sha=$(python -c "import json; m=json.load(open('staged/dist-release/build-manifest.json')); print(m['artifacts']['zip']['sha256'])")
           actual_inst_sha=$(python -c "import json; m=json.load(open('staged/dist-release/build-manifest.json')); print(m['artifacts']['installer']['sha256'])")
           if [[ "${actual_zip_sha}" != "${EXPECTED_ZIP_SHA256}" || "${actual_inst_sha}" != "${EXPECTED_INSTALLER_SHA256}" ]]; then
@@ -236,18 +258,18 @@ jobs:
           fi
           printf '%s' "${UPDATE_SIGNING_KEY_ENC}" > "${UPDATE_SIGNING_KEY_FILE}"
           unset UPDATE_SIGNING_KEY_ENC
-          node staged/native/tools/sign.mjs sign staged/dist-release/manifest.json
-          node staged/native/tools/sign.mjs verify staged/dist-release/manifest.json
+          node tools-repo/native/tools/sign.mjs sign staged/dist-release/manifest.json
+          node tools-repo/native/tools/sign.mjs verify staged/dist-release/manifest.json
           # The training pack's two parts (engine: node.exe + node_modules; campus: code + exercises),
           # which the app downloads only when Training is used.
           for part in engine campus; do
-            node staged/native/tools/sign.mjs sign "staged/dist-release/training-${part}-manifest.json"
-            node staged/native/tools/sign.mjs verify "staged/dist-release/training-${part}-manifest.json"
+            node tools-repo/native/tools/sign.mjs sign "staged/dist-release/training-${part}-manifest.json"
+            node tools-repo/native/tools/sign.mjs verify "staged/dist-release/training-${part}-manifest.json"
           done
-          python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release
-          node staged/native/tools/sign.mjs sign-provenance staged/dist-release/build-manifest.json
-          node staged/native/tools/sign.mjs verify-provenance staged/dist-release/build-manifest.json
-          python staged/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release --require-signature
+          python tools-repo/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release
+          node tools-repo/native/tools/sign.mjs sign-provenance staged/dist-release/build-manifest.json
+          node tools-repo/native/tools/sign.mjs verify-provenance staged/dist-release/build-manifest.json
+          python tools-repo/native/tools/package.py "${RELEASE_VERSION}" staged/dist-release --verify-release --require-signature
 
       - name: Enforce release immutability and publish deterministic release assets
         shell: bash
